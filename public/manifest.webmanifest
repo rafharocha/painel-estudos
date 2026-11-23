@@ -1,0 +1,18 @@
+{
+  "name": "Painel de Estudos + Gemini IA",
+  "short_name": "Painel Estudos",
+  "description": "Painel de Estudos para Concursos com Simulador Gemini, Estudo Reverso Imediato e Caderno de Erros",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#12141c",
+  "theme_color": "#f2a93b",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
+

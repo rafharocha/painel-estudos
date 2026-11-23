@@ -1,0 +1,19 @@
+{
+  "name": "painel-de-estudos",
+  "version": "2.0.0",
+  "description": "Painel de Estudos para Concursos com Integração Google Gemini, Estudo Reverso Imediato e PWA",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test tests/adaptive-engine.test.js tests/state-sync.test.js tests/cloud-deploy.test.js",
+    "migrate:supabase": "node scripts/migrate-to-supabase.js"
+  },
+  "dependencies": {
+    "@google/genai": "*",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2"
+  }
+}
+
