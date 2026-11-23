@@ -27,19 +27,21 @@ const ALLOWED_MODELS = [
   'gemini-4-hydrogen',
   'gemini-3.8-flash',
   'gemini-3.6-flash',
+  'gemini-3-flash-preview',
   'gemini-3.5-flash-lite',
   'gemini-3.1-flash-lite',
   'gemini-4-argon'
 ];
-const DEFAULT_MODEL = 'gemini-3.8-flash';
+const DEFAULT_MODEL = 'gemini-3.5-flash-lite';
 // Apenas modelos disponíveis no Free Tier entram no fallback automático.
 // Modelos exclusivos de Tier Pago (como gemini-4-argon) só são usados quando selecionados explicitamente.
 const AUTO_FALLBACK_MODELS = [
   'gemini-3.5-flash-lite',
+  'gemini-3.6-flash',
+  'gemini-3-flash-preview',
   'gemini-3.1-flash-lite',
   'gemini-3.8-flash',
-  'gemini-4-hydrogen',
-  'gemini-3.6-flash'
+  'gemini-4-hydrogen'
 ];
 
 const storage = createStorageAdapter({ dataDir: DATA_DIR });
@@ -152,6 +154,16 @@ async function saveGeminiSettings(settings) {
   });
 }
 
+function createGeminiClient(apiKey) {
+  // Evita que o SDK fique minutos em backoff interno em caso de 503; o fallback entre modelos é gerenciado por runGeminiInteraction
+  return new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      retryOptions: { attempts: 1 }
+    }
+  });
+}
+
 async function resolveGeminiContext(overrideModel) {
   const settings = await loadGeminiSettings();
   const envKey = (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '').trim();
@@ -162,7 +174,7 @@ async function resolveGeminiContext(overrideModel) {
     throw err;
   }
   const model = ALLOWED_MODELS.includes(overrideModel) ? overrideModel : settings.model;
-  const client = new GoogleGenAI({ apiKey });
+  const client = createGeminiClient(apiKey);
   return { client, model, settings };
 }
 
@@ -185,20 +197,35 @@ function isTransientOrOverloadError(err) {
   );
 }
 
-function isZeroQuotaError(err) {
+function isZeroOrDailyQuotaError(err) {
   const msg = String(err && err.message || err || '').toLowerCase();
   return (
     msg.includes('limit: 0') ||
     msg.includes('limit:0') ||
+    msg.includes('requests per day') ||
     msg.includes('not available on the free tier')
   );
+}
+
+function summarizeGeminiErrorTag(err) {
+  const msg = String(err && err.message || err || '').toLowerCase();
+  const status = err && (err.status || err.statusCode || err.code);
+  if (status === 503 || msg.includes('503') || msg.includes('high demand') || msg.includes('overloaded')) {
+    return '503 alta demanda';
+  }
+  if (msg.includes('requests per day')) return '429 cota diária';
+  if (msg.includes('limit: 0') || msg.includes('limit:0')) return '429 indisponível no Free Tier';
+  if (status === 429 || msg.includes('429') || msg.includes('rate limit') || msg.includes('quota')) {
+    return '429 limite de taxa';
+  }
+  return status ? `erro ${status}` : 'indisponível';
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function callSingleModelInteraction(client, params) {
   if (client.interactions && typeof client.interactions.create === 'function') {
-    const interaction = await client.interactions.create(params);
+    const interaction = await client.interactions.create(params, { maxRetries: 0 });
     return {
       text: interaction.output_text || '',
       id: interaction.id || null,
@@ -243,7 +270,8 @@ export async function runGeminiInteraction(client, params) {
 
   for (let i = 0; i < fallbackOrder.length; i++) {
     const candidateModel = fallbackOrder[i];
-    const maxAttempts = i === 0 ? 2 : 1; // Tenta 2x no modelo principal antes de fazer fallback
+    // No modelo principal, faz até 3 tentativas curtas para superar picos breves de 503; nos fallbacks, 1 tentativa
+    const maxAttempts = i === 0 ? 3 : 1;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         // Se mudou de modelo por fallback, não envia previous_interaction_id de outro modelo
@@ -258,31 +286,34 @@ export async function runGeminiInteraction(client, params) {
         if (!isTransientOrOverloadError(err)) {
           throw err;
         }
-        // Se o modelo tem cota 0 no plano atual (ex: modelo pago no Free Tier), não perde tempo repetindo
-        if (isZeroQuotaError(err)) {
-          attemptErrors.push({ model: candidateModel, message: String(err.message || err) });
+        // Se o modelo tem cota 0 ou esgotou o limite diário (RPD), não perde tempo repetindo
+        if (isZeroOrDailyQuotaError(err)) {
+          attemptErrors.push({ model: candidateModel, tag: summarizeGeminiErrorTag(err), message: String(err.message || err) });
           break;
         }
         if (attempt < maxAttempts) {
-          await sleep(750);
+          await sleep(attempt === 1 ? 1000 : 2200);
         } else {
-          attemptErrors.push({ model: candidateModel, message: String(err.message || err) });
+          attemptErrors.push({ model: candidateModel, tag: summarizeGeminiErrorTag(err), message: String(err.message || err) });
         }
       }
     }
   }
 
   const rootError = primaryError || lastError;
-  const fallbackSummaries = attemptErrors
-    .filter((entry) => entry.model !== primaryModel)
-    .map((entry) => `${entry.model}: ${entry.message}`);
+  const fallbackEntries = attemptErrors.filter((entry) => entry.model !== primaryModel);
 
-  if (fallbackSummaries.length > 0) {
+  if (fallbackEntries.length > 0) {
     const primaryMsg = String((rootError && rootError.message) || rootError || 'Erro desconhecido');
+    const fallbackList = fallbackEntries.map((e) => `${e.model} (${e.tag})`).join(', ');
+    const anyQuota = attemptErrors.some((e) => e.tag.startsWith('429'));
+    const hint = anyQuota
+      ? ' Aguarde alguns segundos e tente novamente (picos de 503 são temporários) ou confira suas cotas em https://aistudio.google.com/rate-limit.'
+      : ' Todos os modelos gratuitos estão com pico temporário de demanda (503) nos servidores do Google. Aguarde alguns segundos e tente novamente.';
     const combined = new Error(
-      `Falha no modelo selecionado (${primaryModel}): ${primaryMsg} | Fallbacks gratuitos também atingiram limite (${attemptErrors.filter((e) => e.model !== primaryModel).map((e) => e.model).join(', ')}). Verifique suas cotas ativas em https://aistudio.google.com/rate-limit.`
+      `Falha no modelo selecionado (${primaryModel}): ${primaryMsg} | Fallbacks tentados: ${fallbackList}.${hint}`
     );
-    combined.status = (rootError && (rootError.status || rootError.statusCode)) || 429;
+    combined.status = (rootError && (rootError.status || rootError.statusCode)) || 503;
     combined.attemptErrors = attemptErrors;
     throw combined;
   }
@@ -395,7 +426,7 @@ app.post('/api/gemini/test', async (req, res) => {
     const { apiKey: tempKey, model: tempModel } = req.body || {};
     let client, model;
     if (tempKey && String(tempKey).trim()) {
-      client = new GoogleGenAI({ apiKey: String(tempKey).trim() });
+      client = createGeminiClient(String(tempKey).trim());
       model = ALLOWED_MODELS.includes(tempModel) ? tempModel : DEFAULT_MODEL;
     } else {
       const ctx = await resolveGeminiContext(tempModel);
