@@ -24,12 +24,23 @@ const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, 'data');
 
 const ALLOWED_MODELS = [
+  'gemini-4-hydrogen',
   'gemini-3.8-flash',
-  'gemini-4-argon',
+  'gemini-3.6-flash',
   'gemini-3.5-flash-lite',
-  'gemini-3.1-flash-lite'
+  'gemini-3.1-flash-lite',
+  'gemini-4-argon'
 ];
 const DEFAULT_MODEL = 'gemini-3.8-flash';
+// Apenas modelos disponíveis no Free Tier entram no fallback automático.
+// Modelos exclusivos de Tier Pago (como gemini-4-argon) só são usados quando selecionados explicitamente.
+const AUTO_FALLBACK_MODELS = [
+  'gemini-3.5-flash-lite',
+  'gemini-3.1-flash-lite',
+  'gemini-3.8-flash',
+  'gemini-4-hydrogen',
+  'gemini-3.6-flash'
+];
 
 const storage = createStorageAdapter({ dataDir: DATA_DIR });
 const auth = createAuthHelper();
@@ -164,11 +175,22 @@ function isTransientOrOverloadError(err) {
     status === 500 ||
     msg.includes('503') ||
     msg.includes('429') ||
+    msg.includes('rate limit') ||
+    msg.includes('quota') ||
     msg.includes('high demand') ||
     msg.includes('overloaded') ||
     msg.includes('unavailable') ||
     msg.includes('resource_exhausted') ||
     msg.includes('try again later')
+  );
+}
+
+function isZeroQuotaError(err) {
+  const msg = String(err && err.message || err || '').toLowerCase();
+  return (
+    msg.includes('limit: 0') ||
+    msg.includes('limit:0') ||
+    msg.includes('not available on the free tier')
   );
 }
 
@@ -208,40 +230,64 @@ async function callSingleModelInteraction(client, params) {
 }
 
 // Helper com retry automático e fallback inteligente de modelo em caso de pico de demanda (503 / 429) nos servidores do Google
-async function runGeminiInteraction(client, params) {
-  const primaryModel = params.model || DEFAULT_MODEL;
-  const fallbackOrder = [
-    primaryModel,
-    'gemini-3.5-flash-lite',
-    'gemini-3.1-flash-lite',
-    'gemini-3.8-flash',
-    'gemini-4-argon'
-  ].filter((m, idx, arr) => ALLOWED_MODELS.includes(m) && arr.indexOf(m) === idx);
+export async function runGeminiInteraction(client, params) {
+  const { allowFallback = true, ...baseParams } = params || {};
+  const primaryModel = baseParams.model || DEFAULT_MODEL;
+  const fallbackOrder = allowFallback
+    ? [primaryModel, ...AUTO_FALLBACK_MODELS].filter((m, idx, arr) => ALLOWED_MODELS.includes(m) && arr.indexOf(m) === idx)
+    : [primaryModel];
 
+  let primaryError = null;
   let lastError = null;
+  const attemptErrors = [];
+
   for (let i = 0; i < fallbackOrder.length; i++) {
     const candidateModel = fallbackOrder[i];
     const maxAttempts = i === 0 ? 2 : 1; // Tenta 2x no modelo principal antes de fazer fallback
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         // Se mudou de modelo por fallback, não envia previous_interaction_id de outro modelo
-        const callParams = { ...params, model: candidateModel };
+        const callParams = { ...baseParams, model: candidateModel };
         if (candidateModel !== primaryModel && callParams.previous_interaction_id) {
           delete callParams.previous_interaction_id;
         }
         return await callSingleModelInteraction(client, callParams);
       } catch (err) {
         lastError = err;
+        if (i === 0) primaryError = err;
         if (!isTransientOrOverloadError(err)) {
           throw err;
         }
+        // Se o modelo tem cota 0 no plano atual (ex: modelo pago no Free Tier), não perde tempo repetindo
+        if (isZeroQuotaError(err)) {
+          attemptErrors.push({ model: candidateModel, message: String(err.message || err) });
+          break;
+        }
         if (attempt < maxAttempts) {
           await sleep(750);
+        } else {
+          attemptErrors.push({ model: candidateModel, message: String(err.message || err) });
         }
       }
     }
   }
-  throw lastError;
+
+  const rootError = primaryError || lastError;
+  const fallbackSummaries = attemptErrors
+    .filter((entry) => entry.model !== primaryModel)
+    .map((entry) => `${entry.model}: ${entry.message}`);
+
+  if (fallbackSummaries.length > 0) {
+    const primaryMsg = String((rootError && rootError.message) || rootError || 'Erro desconhecido');
+    const combined = new Error(
+      `Falha no modelo selecionado (${primaryModel}): ${primaryMsg} | Fallbacks gratuitos também atingiram limite (${attemptErrors.filter((e) => e.model !== primaryModel).map((e) => e.model).join(', ')}). Verifique suas cotas ativas em https://aistudio.google.com/rate-limit.`
+    );
+    combined.status = (rootError && (rootError.status || rootError.statusCode)) || 429;
+    combined.attemptErrors = attemptErrors;
+    throw combined;
+  }
+
+  throw rootError;
 }
 
 function maskKey(k) {
@@ -933,7 +979,7 @@ Estruture sua resposta em Markdown nestas 4 seções claras e coesas:
 
     res.json({
       ok: true,
-      model,
+      model: result.usedModel || model,
       analiseMarkdown: finalMarkdown,
       resumoMentor,
       interactionId: result.id
@@ -1018,7 +1064,7 @@ Responda de forma didática, firme, direta e em Markdown.`
     const result = await runGeminiInteraction(client, interactionParams);
     res.json({
       ok: true,
-      model,
+      model: result.usedModel || model,
       respostaMarkdown: result.text.trim(),
       interactionId: result.id
     });

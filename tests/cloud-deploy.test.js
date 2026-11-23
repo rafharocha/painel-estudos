@@ -333,3 +333,53 @@ test('server.js: fluxo completo com senha + compressão gzip-json no /api/state/
     }
   }
 });
+
+test('runGeminiInteraction: nunca faz fallback automático para gemini-4-argon e preserva erro real do modelo selecionado', async () => {
+  const { runGeminiInteraction } = await import(`../server.js?gemini-fallback=${Date.now()}`);
+  const calledModels = [];
+  const fakeClient = {
+    interactions: {
+      async create({ model }) {
+        calledModels.push(model);
+        const err = new Error(`429 Rate limit exceeded for model ${model} (limit: 0 input tokens per minute on Free Tier).`);
+        err.status = 429;
+        throw err;
+      }
+    }
+  };
+
+  await assert.rejects(
+    () => runGeminiInteraction(fakeClient, { model: 'gemini-3.5-flash-lite', input: 'ping' }),
+    (err) => {
+      assert.equal(err.status, 429);
+      assert.ok(err.message.includes('gemini-3.5-flash-lite'), `Erro deveria mencionar modelo selecionado: ${err.message}`);
+      assert.ok(!err.message.includes('gemini-4-argon'), `Erro não deveria mencionar gemini-4-argon: ${err.message}`);
+      return true;
+    }
+  );
+
+  assert.equal(calledModels.includes('gemini-4-argon'), false);
+  // Com limit: 0, não desperdiça retry duplicado no mesmo modelo
+  assert.equal(calledModels.filter((m) => m === 'gemini-3.5-flash-lite').length, 1);
+  assert.ok(calledModels.includes('gemini-4-hydrogen'));
+});
+
+test('runGeminiInteraction: faz fallback automático para outro modelo Free Tier quando o principal está em 429', async () => {
+  const { runGeminiInteraction } = await import(`../server.js?gemini-ok=${Date.now()}`);
+  const fakeClient = {
+    interactions: {
+      async create({ model }) {
+        if (model === 'gemini-4-hydrogen') {
+          return { id: 'inter-1', output_text: 'Conectado!' };
+        }
+        const err = new Error(`429 Rate limit exceeded for model ${model} (limit: 0 input tokens per minute on Free Tier).`);
+        err.status = 429;
+        throw err;
+      }
+    }
+  };
+
+  const result = await runGeminiInteraction(fakeClient, { model: 'gemini-3.8-flash', input: 'ping' });
+  assert.equal(result.usedModel, 'gemini-4-hydrogen');
+  assert.equal(result.text, 'Conectado!');
+});
