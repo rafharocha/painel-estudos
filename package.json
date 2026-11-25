@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "test": "node --test tests/adaptive-engine.test.js tests/state-sync.test.js tests/cloud-deploy.test.js",
+    "test": "node --test tests/adaptive-engine.test.js tests/state-sync.test.js tests/cloud-deploy.test.js tests/question-bank.test.js",
     "migrate:supabase": "node scripts/migrate-to-supabase.js"
   },
   "dependencies": {

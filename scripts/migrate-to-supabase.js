@@ -10,6 +10,7 @@ const ROOT_DIR = path.resolve(__dirname, '..');
 const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(ROOT_DIR, 'data');
 const LOCAL_STATE_FILE = path.join(DATA_DIR, 'painel-data.json');
 const LOCAL_SETTINGS_FILE = path.join(DATA_DIR, 'gemini-settings.json');
+const LOCAL_QUESTION_BANK_FILE = path.join(DATA_DIR, 'question-bank.json');
 
 const forceFlag = process.argv.includes('--force');
 
@@ -94,6 +95,35 @@ async function main() {
     console.log('✅ Preferências do Gemini (modelo e autópsia automática) sincronizadas (a API Key continua segura via variável GEMINI_API_KEY na Vercel).');
   } catch {
     // Sem gemini-settings.json local — tudo bem
+  }
+
+  // Migra também o Banco Permanente de Questões (question-bank.json local + backfill do histórico)
+  try {
+    let localBankQuestions = [];
+    try {
+      const rawBank = await fs.readFile(LOCAL_QUESTION_BANK_FILE, 'utf-8');
+      const parsedBank = JSON.parse(rawBank);
+      localBankQuestions = Array.isArray(parsedBank) ? parsedBank : (Array.isArray(parsedBank && parsedBank.questions) ? parsedBank.questions : []);
+    } catch {
+      // Sem question-bank.json local ainda
+    }
+
+    if (localBankQuestions.length > 0) {
+      console.log(`⬆️  Enviando ${localBankQuestions.length} questão(ões) de question-bank.json para public.painel_questions...`);
+      const bankRes = await storage.saveQuestionsToBank(localBankQuestions, { insertOnlyNew: true });
+      console.log(`✅ question-bank.json migrado (${bankRes.inserted} nova(s), ${bankRes.skipped} já existente(s)).`);
+    }
+
+    console.log('🗄️  Executando backfill das questões já salvas no histórico (painel-data.json) para public.painel_questions...');
+    const bfRes = await storage.backfillQuestionsFromState(localState);
+    console.log(`✅ Backfill concluído: ${bfRes.inserted} importada(s), ${bfRes.skipped} já existente(s) (de ${bfRes.extracted} encontradas).`);
+  } catch (bankErr) {
+    if (bankErr && bankErr.code === 'QUESTIONS_TABLE_MISSING') {
+      console.warn(`⚠️  ${bankErr.message}`);
+      console.warn('   O painel principal foi migrado, mas execute o SQL da tabela painel_questions e rode o botão de backfill no Gerenciador.');
+    } else {
+      console.warn('⚠️  Aviso ao migrar Banco de Questões:', bankErr.message);
+    }
   }
 
   console.log('\n🎉 Migração concluída! Seu Painel na Vercel já pode ler seus dados do Supabase.');

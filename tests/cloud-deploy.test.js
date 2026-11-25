@@ -209,13 +209,17 @@ test('server.js: fluxo completo com senha + compressão gzip-json no /api/state/
     DATA_DIR: process.env.DATA_DIR,
     APP_PASSWORD: process.env.APP_PASSWORD,
     SUPABASE_URL: process.env.SUPABASE_URL,
-    SUPABASE_SECRET_KEY: process.env.SUPABASE_SECRET_KEY
+    SUPABASE_SECRET_KEY: process.env.SUPABASE_SECRET_KEY,
+    SUPABASE_SERVICE_ROLE_KEY: process.env.SUPABASE_SERVICE_ROLE_KEY,
+    SUPABASE_KEY: process.env.SUPABASE_KEY
   };
 
   process.env.DATA_DIR = tmpDir;
   process.env.APP_PASSWORD = 'senha-teste-123';
-  delete process.env.SUPABASE_URL;
-  delete process.env.SUPABASE_SECRET_KEY;
+  process.env.SUPABASE_URL = '';
+  process.env.SUPABASE_SECRET_KEY = '';
+  process.env.SUPABASE_SERVICE_ROLE_KEY = '';
+  process.env.SUPABASE_KEY = '';
 
   // Import com query string única para instanciar o app com as env vars de teste
   const { default: app } = await import(`../server.js?test=${Date.now()}`);

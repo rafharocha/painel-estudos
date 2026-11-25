@@ -2211,6 +2211,80 @@
       border: 1px solid rgba(226, 114, 91, 0.45);
     }
 
+    .sim-q-tag.bank-q {
+      background: rgba(106, 168, 216, 0.16);
+      color: #8cc5f2;
+      border: 1px solid rgba(106, 168, 216, 0.45);
+    }
+
+    .sim-bank-bar {
+      background: rgba(106, 168, 216, 0.08);
+      border: 1px solid rgba(106, 168, 216, 0.3);
+      border-radius: 6px;
+      padding: 10px 12px;
+      margin: 10px 0 4px;
+      font-size: 12.5px;
+    }
+
+    .sim-bank-bar-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .sim-bank-options {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-top: 8px;
+      padding-top: 8px;
+      border-top: 1px dashed rgba(106, 168, 216, 0.25);
+    }
+
+    .sim-bank-options select {
+      width: auto;
+      min-width: 210px;
+      padding: 5px 8px;
+      font-size: 12px;
+    }
+
+    .sim-fallback-card {
+      background: rgba(226, 114, 91, 0.11);
+      border: 1px solid rgba(226, 114, 91, 0.5);
+      border-left: 4px solid var(--coral);
+      border-radius: 6px;
+      padding: 14px 16px;
+      margin: 12px 0;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .sim-fallback-card .fb-title {
+      font-weight: 700;
+      color: var(--coral);
+      margin-bottom: 4px;
+    }
+
+    .sim-fallback-card .fb-err {
+      font-size: 11.5px;
+      color: var(--text-dim);
+      background: rgba(0, 0, 0, 0.22);
+      padding: 6px 8px;
+      border-radius: 4px;
+      margin: 6px 0 10px;
+      word-break: break-word;
+    }
+
+    .sim-fallback-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+    }
+
     .sim-enunciado {
       font-size: 14.5px;
       line-height: 1.65;
@@ -4038,9 +4112,12 @@
                 </div>
               </div>
               <div id="simRevisionPreview"></div>
+              <div id="simBankStatusBar"></div>
+              <div id="simAiFallbackBox" style="display:none;"></div>
               <div class="form-actions" style="display:flex;gap:8px;flex-wrap:wrap;">
                 <button class="primary" id="btnStartSim">✨ Montar e Iniciar Bateria</button>
                 <button type="button" class="good" id="btnSaveOfflinePack" title="Gera as questões agora e guarda em Baterias Salvas para você resolver depois (inclusive offline no celular)">📦 Gerar e Salvar para Offline</button>
+                <button type="button" id="btnStartFromBank" title="Monta a bateria usando questões já salvas/respondidas do seu Banco de Questões, sem chamar a IA">🗄️ Montar do Banco</button>
               </div>
             </div>
 
@@ -4665,6 +4742,7 @@
             <button id="btnExport">Exportar backup (.json)</button>
             <button id="btnImportTrigger">Importar backup</button>
             <button id="btnCalibrateLegacyMastery" title="Opcional: estima pontuação inicial (0–820) dos subtópicos que já possuem histórico de sessões antes do novo algoritmo">🎯 Calibrar níveis (0–1000) pelo histórico</button>
+            <button id="btnBackfillQuestionBank" title="Importa todas as questões já registradas no seu histórico antigo para o Banco Permanente de Questões">🗄️ Importar questões antigas para o Banco</button>
             <input type="file" id="importFile" accept=".json" style="display:none;">
             <br>
             <button class="danger" id="btnReset">Apagar dados deste edital</button>
@@ -10938,6 +11016,8 @@ ${questionsText}`;
       if (!assuntoIds.length) {
         box.innerHTML = '';
         if (cardWrap) cardWrap.innerHTML = '';
+        const bankBar = document.getElementById('simBankStatusBar');
+        if (bankBar) bankBar.innerHTML = '';
         return;
       }
 
@@ -11097,6 +11177,7 @@ ${questionsText}`;
           <div class="hint" style="margin-top:4px;">Erros selecionados com aderência à <b>Matriz N1–N5</b> do seu nível (atrasos ≥3d têm prioridade). Ao acertar com <b>Certeza</b>, avançam automaticamente em <b>1d → 4d → 10d → 25d → 🏆</b>!</div>${warmupLine}
         </div>
       `;
+      scheduleSimBankStatsRefresh();
     }
 
     document.getElementById('simMateriaSelect').addEventListener('change', populateSimAssuntoChecks);
@@ -11486,7 +11567,434 @@ ${questionsText}`;
       });
     };
 
-    async function generateOrPrepareBattery({ saveOnly = false, isValidationBattery = false } = {}) {
+    // ---------- BANCO PERMANENTE DE QUESTÕES & FALLBACK DE IA ----------
+    const BANK_LETTER_REF_REGEX = /\b(alternativas?|itens?|letras?|op[çc][õo]es)\s+[A-E]\b|\b[A-E]\s+e\s+[A-E]\b|todas\s+as\s+(anteriores|acima|alternativas|demais)|nenhuma\s+das\s+(anteriores|acima|alternativas|demais)|est[áa]\s+corret[ao]\s+apenas\s+[A-E]/i;
+    let simBankStatsCache = { totalEdital: 0, totalMateria: 0, totalSubtopics: 0, errorsSubtopics: 0, errorsMateria: 0, tableMissing: false, loaded: false };
+    let simBankUiPrefs = { mode: 'smart', expandToMateria: true, shuffleAlternatives: true, optionsOpen: false };
+    let simBankStatsTimer = null;
+    let simBankStatsReqSeq = 0;
+    let simBankAutoBackfillDone = false;
+
+    function shuffleBankAltsClient(question) {
+      const alts = Array.isArray(question && question.alternativas) ? question.alternativas : [];
+      if (alts.length < 3) return { ...question, alternativasEmbaralhadas: false };
+      const letters = alts.map(a => String(a.letra || '').trim().toUpperCase());
+      if (letters.length === 2 && letters.slice().sort().join('') === 'CE') {
+        return { ...question, alternativasEmbaralhadas: false };
+      }
+      const origCorreta = String(question.correta || '').trim().toUpperCase();
+      if (!letters.includes(origCorreta)) return { ...question, alternativasEmbaralhadas: false };
+      const combined = `${question.enunciado || ''}\n${alts.map(a => a.texto || '').join('\n')}`;
+      if (BANK_LETTER_REF_REGEX.test(combined)) return { ...question, alternativasEmbaralhadas: false };
+
+      const tagged = alts.map(a => ({
+        texto: a.texto,
+        isCorrect: String(a.letra || '').trim().toUpperCase() === origCorreta
+      }));
+      for (let i = tagged.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [tagged[i], tagged[j]] = [tagged[j], tagged[i]];
+      }
+      let newCorreta = origCorreta;
+      const shuffled = tagged.map((item, idx) => {
+        const letra = letters[idx];
+        if (item.isCorrect) newCorreta = letra;
+        return { letra, texto: item.texto };
+      });
+      return { ...question, alternativas: shuffled, correta: newCorreta, alternativasEmbaralhadas: true };
+    }
+
+    function countLocalSavedQuestions(materiaId, assuntoIds) {
+      const assSet = new Set(Array.isArray(assuntoIds) ? assuntoIds : []);
+      const seenSub = new Set();
+      const seenMat = new Set();
+      (state.log || []).forEach(l => {
+        (l.errors || []).forEach(e => {
+          if (!e || e.mergedIntoSourceRef) return;
+          const hasPlayable = (Array.isArray(e.alternativas) && e.alternativas.length >= 2 && e.enunciado)
+            || (String(e.texto || '').trim().length >= 20);
+          if (!hasPlayable) return;
+          const sig = normTxt(e.enunciado || e.texto || '').slice(0, 140);
+          if (!sig) return;
+          const aid = e.assuntoId || l.assuntoId;
+          if (aid && assSet.has(aid)) seenSub.add(sig);
+          if (materiaId && l.materiaId === materiaId) seenMat.add(sig);
+        });
+      });
+      return { localSubtopics: seenSub.size, localMateria: seenMat.size };
+    }
+
+    function collectLocalFallbackQuestions({ materiaId, assuntoIds = [], limit = 5, mode = 'smart', expandToMateria = false, shuffleAlternatives = true, excludeTexts = new Set() } = {}) {
+      const assSet = new Set(Array.isArray(assuntoIds) ? assuntoIds : []);
+      const bySig = new Map();
+
+      (state.log || []).forEach(l => {
+        (l.errors || []).forEach((e, idx) => {
+          if (!e || e.mergedIntoSourceRef) return;
+          const aid = e.assuntoId || l.assuntoId;
+          const inSub = Boolean(aid && assSet.has(aid));
+          const inMat = Boolean(materiaId && l.materiaId === materiaId);
+          if (!inSub && !(expandToMateria && inMat)) return;
+          if (!e.enunciado && !e.texto) return;
+          const aObj = (state.assuntos || []).find(x => x.id === aid);
+          const parsed = parseSavedErrorToQuestion(e, aObj ? aObj.nome : (e.assunto || materiaNome(l.materiaId)));
+          if (!parsed.enunciado || !Array.isArray(parsed.alternativas) || parsed.alternativas.length < 2) return;
+          const sig = normTxt(parsed.enunciado).slice(0, 160);
+          if (!sig || excludeTexts.has(sig)) return;
+
+          const existing = bySig.get(sig);
+          const lastDt = e.srsLastReviewDate || l.date || '';
+          const d = new Date(lastDt || Date.now());
+          const candidate = {
+            isFromBank: true,
+            isReview: !e.revisado,
+            isActiveReview: false,
+            isExactReview: false,
+            isErrorReinforcement: false,
+            reviewConceptId: null,
+            geradaPelaIA: Boolean(e.geradaPelaIA !== false),
+            assuntoId: aid || assuntoIds[0] || null,
+            assunto: parsed.assunto || (aObj && aObj.nome) || materiaNome(l.materiaId),
+            nivel: AE.formatQuestionLevel(e.nivel || 2),
+            conceitoChave: e.conceitoChave || parsed.assunto || '',
+            enunciado: parsed.enunciado,
+            alternativas: parsed.alternativas,
+            correta: String(parsed.correta || e.correta || 'A').trim().toUpperCase(),
+            resolucaoPassoAPassoVerificada: e.resolucaoPassoAPassoVerificada || '',
+            comentarioProfessor: e.comentario || '',
+            analiseIA: '',
+            pastAnaliseIA: e.analiseIA || '',
+            resumoMentor: e.resumoMentor || '',
+            link: e.link || '',
+            lastResult: e.confidence === 'chute' ? 'chute' : 'error',
+            lastAnsweredAt: lastDt || null,
+            pastDate: `${pad(d.getDate())}/${pad(d.getMonth() + 1)}`,
+            timesAnswered: 1 + (Array.isArray(e.srsHistory) ? e.srsHistory.length : 0),
+            _inSub: inSub,
+            _revisado: Boolean(e.revisado),
+            _ts: new Date(lastDt || 0).getTime() || 0,
+            sourceRefs: [{ logId: l.id, idx }]
+          };
+          if (!existing || (candidate._inSub && !existing._inSub)) {
+            bySig.set(sig, candidate);
+          }
+        });
+      });
+
+      const list = Array.from(bySig.values());
+      list.sort((a, b) =>
+        (Number(b._inSub) - Number(a._inSub)) ||
+        (mode === 'all_oldest' ? 0 : (Number(a._revisado) - Number(b._revisado))) ||
+        (a._ts - b._ts)
+      );
+
+      return list.slice(0, Math.max(1, limit)).map((item) => {
+        const { _inSub, _revisado, _ts, ...clean } = item;
+        return shuffleAlternatives ? shuffleBankAltsClient(clean) : { ...clean, alternativasEmbaralhadas: false };
+      });
+    }
+
+    function hideSimAiFallbackBox() {
+      const box = document.getElementById('simAiFallbackBox');
+      if (box) {
+        box.style.display = 'none';
+        box.innerHTML = '';
+      }
+    }
+
+    function renderSimBankStatusBar() {
+      const bar = document.getElementById('simBankStatusBar');
+      if (!bar) return;
+      const materiaId = document.getElementById('simMateriaSelect') ? document.getElementById('simMateriaSelect').value : '';
+      const assuntoIds = getSelectedSimAssuntoIds();
+      if (!materiaId || !assuntoIds.length) {
+        bar.innerHTML = '';
+        return;
+      }
+
+      const localCounts = countLocalSavedQuestions(materiaId, assuntoIds);
+      const subCount = Math.max(simBankStatsCache.totalSubtopics || 0, localCounts.localSubtopics);
+      const matCount = Math.max(simBankStatsCache.totalMateria || 0, localCounts.localMateria);
+      const totalEdital = simBankStatsCache.totalEdital || 0;
+
+      const btnBank = document.getElementById('btnStartFromBank');
+      if (btnBank) {
+        const avail = simBankUiPrefs.expandToMateria ? matCount : subCount;
+        btnBank.textContent = avail > 0 ? `🗄️ Montar do Banco (${avail} disp.)` : '🗄️ Montar do Banco';
+      }
+
+      const tableNotice = simBankStatsCache.tableMissing
+        ? `<div class="hint" style="margin-top:4px;color:var(--amber);">⚠️ A tabela <code>painel_questions</code> ainda não foi criada no Supabase (rode o SQL de <code>supabase-schema.sql</code>). Enquanto isso, o fallback local continua funcionando com seus erros salvos.</div>`
+        : '';
+
+      bar.innerHTML = `
+        <div class="sim-bank-bar">
+          <div class="sim-bank-bar-head">
+            <div>
+              <b style="color:#8cc5f2;">🗄️ Banco Permanente de Questões:</b>
+              <span><b>${subCount}</b> no(s) subtópico(s)</span>
+              <span>· <b>${matCount}</b> na matéria</span>
+              ${totalEdital > 0 ? `<span class="hint">(${totalEdital} no edital)</span>` : ''}
+            </div>
+            <button type="button" class="small ghost" id="btnToggleBankOpts" style="padding:3px 8px;font-size:11.5px;">
+              ${simBankUiPrefs.optionsOpen ? '▲ Ocultar opções do banco' : '⚙️ Opções do banco'}
+            </button>
+          </div>
+          ${tableNotice}
+          <div class="sim-bank-options" id="simBankOptionsRow" style="${simBankUiPrefs.optionsOpen ? '' : 'display:none;'}">
+            <select id="simBankModeSelect" title="Critério de seleção quando montar bateria pelo Banco">
+              <option value="smart" ${simBankUiPrefs.mode === 'smart' ? 'selected' : ''}>🧠 Inteligente (não vistas + erros + mais antigas)</option>
+              <option value="errors_first" ${simBankUiPrefs.mode === 'errors_first' ? 'selected' : ''}>🎯 Somente questões erradas/chutadas</option>
+              <option value="all_oldest" ${simBankUiPrefs.mode === 'all_oldest' ? 'selected' : ''}>🕰️ Todas as respondidas (mais antigas primeiro)</option>
+            </select>
+            <label class="flag-check" style="margin:0;">
+              <input type="checkbox" id="simBankExpandMateria" ${simBankUiPrefs.expandToMateria ? 'checked' : ''}> Completar com outros subtópicos da matéria se faltar
+            </label>
+            <label class="flag-check" style="margin:0;">
+              <input type="checkbox" id="simBankShuffleAlts" ${simBankUiPrefs.shuffleAlternatives ? 'checked' : ''}> Embaralhar alternativas (A–E)
+            </label>
+          </div>
+        </div>
+      `;
+
+      const toggleBtn = document.getElementById('btnToggleBankOpts');
+      if (toggleBtn) {
+        toggleBtn.onclick = () => {
+          simBankUiPrefs.optionsOpen = !simBankUiPrefs.optionsOpen;
+          renderSimBankStatusBar();
+        };
+      }
+      const modeSel = document.getElementById('simBankModeSelect');
+      if (modeSel) {
+        modeSel.onchange = () => {
+          simBankUiPrefs.mode = modeSel.value;
+        };
+      }
+      const expChk = document.getElementById('simBankExpandMateria');
+      if (expChk) {
+        expChk.onchange = () => {
+          simBankUiPrefs.expandToMateria = expChk.checked;
+          renderSimBankStatusBar();
+        };
+      }
+      const shufChk = document.getElementById('simBankShuffleAlts');
+      if (shufChk) {
+        shufChk.onchange = () => {
+          simBankUiPrefs.shuffleAlternatives = shufChk.checked;
+        };
+      }
+    }
+
+    async function refreshSimBankStats() {
+      const materiaId = document.getElementById('simMateriaSelect') ? document.getElementById('simMateriaSelect').value : '';
+      const assuntoIds = getSelectedSimAssuntoIds();
+      renderSimBankStatusBar();
+      if (!materiaId || !assuntoIds.length || isAppOffline()) return;
+
+      const reqSeq = ++simBankStatsReqSeq;
+      try {
+        const qs = new URLSearchParams({
+          editalId: state.activeEdital || 'default',
+          materiaId,
+          assuntoIds: assuntoIds.join(',')
+        });
+        const res = await fetch('/api/questions/stats?' + qs.toString());
+        if (!res.ok) return;
+        const data = await res.json();
+        if (reqSeq !== simBankStatsReqSeq || !data || !data.ok) return;
+
+        simBankStatsCache = {
+          ...(data.stats || {}),
+          tableMissing: Boolean(data.tableMissing),
+          loaded: true
+        };
+        renderSimBankStatusBar();
+
+        // Backfill automático e silencioso na primeira vez se o banco estiver vazio mas já houver erros no histórico
+        if (!simBankAutoBackfillDone && !data.tableMissing && (simBankStatsCache.totalEdital || 0) === 0) {
+          const hasAnyErrors = Object.values(state.bank || {}).some(c =>
+            Array.isArray(c && c.log) && c.log.some(l => Array.isArray(l && l.errors) && l.errors.length > 0)
+          );
+          if (hasAnyErrors) {
+            simBankAutoBackfillDone = true;
+            const bfRes = await fetch('/api/questions/backfill', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({})
+            });
+            if (bfRes.ok) {
+              const bfData = await bfRes.json();
+              if (bfData && bfData.ok && bfData.inserted > 0) {
+                refreshSimBankStats();
+              }
+            }
+          }
+        }
+      } catch {
+        // Ignora erro de rede ao consultar estatísticas
+      }
+    }
+
+    function scheduleSimBankStatsRefresh() {
+      if (simBankStatsTimer) clearTimeout(simBankStatsTimer);
+      renderSimBankStatusBar();
+      simBankStatsTimer = setTimeout(() => {
+        refreshSimBankStats();
+      }, 180);
+    }
+
+    async function showSimAiFallbackBox({ errorMessage, materiaId, assuntoIds, totalQtd, saveOnly, isValidationBattery }) {
+      const box = document.getElementById('simAiFallbackBox');
+      if (!box) return;
+
+      // Garante estatísticas atualizadas antes de exibir as opções de resgate
+      const localCounts = countLocalSavedQuestions(materiaId, assuntoIds);
+      let subCount = Math.max(simBankStatsCache.totalSubtopics || 0, localCounts.localSubtopics);
+      let matCount = Math.max(simBankStatsCache.totalMateria || 0, localCounts.localMateria);
+      if (!isAppOffline()) {
+        try {
+          const qs = new URLSearchParams({
+            editalId: state.activeEdital || 'default',
+            materiaId,
+            assuntoIds: assuntoIds.join(',')
+          });
+          const r = await fetch('/api/questions/stats?' + qs.toString());
+          if (r.ok) {
+            const d = await r.json();
+            if (d && d.ok && d.stats) {
+              simBankStatsCache = { ...d.stats, tableMissing: Boolean(d.tableMissing), loaded: true };
+              subCount = Math.max(d.stats.totalSubtopics || 0, localCounts.localSubtopics);
+              matCount = Math.max(d.stats.totalMateria || 0, localCounts.localMateria);
+              renderSimBankStatusBar();
+            }
+          }
+        } catch { /* usa contagem local */ }
+      }
+
+      const hasAny = subCount > 0 || matCount > 0;
+      box.style.display = '';
+      box.innerHTML = `
+        <div class="sim-fallback-card">
+          <div class="fb-title">⚠️ O modelo Gemini falhou ao gerar novas questões agora</div>
+          <div class="fb-err">${escapeHtml(errorMessage || 'Instabilidade ou cota atingida no modelo.')}</div>
+          ${hasAny
+            ? `<div>Mas você <b>não precisa parar seus estudos</b>! Encontramos <b>${subCount} questão(ões)</b> no seu Banco para os subtópicos selecionados e <b>${matCount}</b> na matéria <b>${escapeHtml(materiaNome(materiaId))}</b> (já com gabarito e comentário do professor salvos).</div>`
+            : `<div>Ainda não há questões salvas no banco para esta matéria. Assim que você gerar baterias novas, elas serão guardadas automaticamente para fallback futuro.</div>`}
+          <div class="sim-fallback-actions">
+            ${subCount > 0 ? `<button type="button" class="primary" id="btnFbUseSubtopic">🗄️ Montar do Banco (${Math.min(totalQtd, subCount)}q · mesmo subtópico)</button>` : ''}
+            ${matCount > subCount ? `<button type="button" class="good" id="btnFbUseMateria">📚 Expandir para Matéria inteira (${Math.min(totalQtd, matCount)}q)</button>` : ''}
+            <button type="button" id="btnFbRetryAi">🔄 Tentar Gemini novamente</button>
+            <button type="button" class="ghost small" id="btnFbDismiss">✕ Fechar</button>
+          </div>
+        </div>
+      `;
+
+      const bSub = document.getElementById('btnFbUseSubtopic');
+      if (bSub) {
+        bSub.onclick = () => {
+          hideSimAiFallbackBox();
+          generateOrPrepareBattery({
+            saveOnly,
+            isValidationBattery,
+            source: 'bank',
+            expandToMateria: false,
+            bankMode: simBankUiPrefs.mode,
+            shuffleAlternatives: simBankUiPrefs.shuffleAlternatives
+          });
+        };
+      }
+      const bMat = document.getElementById('btnFbUseMateria');
+      if (bMat) {
+        bMat.onclick = () => {
+          hideSimAiFallbackBox();
+          generateOrPrepareBattery({
+            saveOnly,
+            isValidationBattery,
+            source: 'bank',
+            expandToMateria: true,
+            bankMode: simBankUiPrefs.mode,
+            shuffleAlternatives: simBankUiPrefs.shuffleAlternatives
+          });
+        };
+      }
+      const bRetry = document.getElementById('btnFbRetryAi');
+      if (bRetry) {
+        bRetry.onclick = () => {
+          hideSimAiFallbackBox();
+          generateOrPrepareBattery({ saveOnly, isValidationBattery, source: 'ai' });
+        };
+      }
+      const bDis = document.getElementById('btnFbDismiss');
+      if (bDis) bDis.onclick = hideSimAiFallbackBox;
+
+      box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+
+    async function drawQuestionsFromBankWithFallback({ materiaId, assuntoIds, formato, totalQtd, plan, bankMode, expandToMateria, shuffleAlternatives }) {
+      let drawn = [];
+      let meta = { fromSubtopics: 0, fromMateria: 0, expandedToMateria: false };
+
+      if (!isAppOffline()) {
+        try {
+          const res = await fetch('/api/questions/draw', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              editalId: state.activeEdital || 'default',
+              materiaId,
+              assuntoIds,
+              formato,
+              mode: bankMode || simBankUiPrefs.mode || 'smart',
+              limit: totalQtd,
+              slotPlan: plan,
+              expandToMateria: Boolean(expandToMateria),
+              shuffleAlternatives: shuffleAlternatives !== false
+            })
+          });
+          if (res.ok) {
+            const data = await res.json();
+            if (data && data.ok && Array.isArray(data.questoes)) {
+              drawn = data.questoes;
+              meta = data.meta || meta;
+            }
+          }
+        } catch {
+          // Segue para fallback local de state.log[].errors
+        }
+      }
+
+      // Se o banco do servidor não retornou o suficiente (ex: offline ou tabela ainda não migrada), completa com erros locais
+      if (drawn.length < totalQtd) {
+        const excludeTexts = new Set(drawn.map(q => normTxt(q.enunciado || '').slice(0, 160)).filter(Boolean));
+        const extraLocal = collectLocalFallbackQuestions({
+          materiaId,
+          assuntoIds,
+          limit: totalQtd - drawn.length,
+          mode: bankMode || simBankUiPrefs.mode || 'smart',
+          expandToMateria: Boolean(expandToMateria),
+          shuffleAlternatives: shuffleAlternatives !== false,
+          excludeTexts
+        });
+        if (extraLocal.length) {
+          drawn = [...drawn, ...extraLocal];
+          meta.fromSubtopics = drawn.filter(q => assuntoIds.includes(q.assuntoId)).length;
+          meta.fromMateria = drawn.length - meta.fromSubtopics;
+          meta.expandedToMateria = meta.fromMateria > 0;
+        }
+      }
+
+      return { questions: drawn, meta };
+    }
+
+    async function generateOrPrepareBattery({
+      saveOnly = false,
+      isValidationBattery = false,
+      source = 'ai',
+      bankMode = null,
+      expandToMateria = null,
+      shuffleAlternatives = null
+    } = {}) {
+      hideSimAiFallbackBox();
       const materiaId = document.getElementById('simMateriaSelect').value;
       const assuntoIds = getSelectedSimAssuntoIds();
       const totalQtd = Math.max(1, Math.min(20, parseInt(document.getElementById('simTotalQtd').value, 10) || 5));
@@ -11518,19 +12026,46 @@ ${questionsText}`;
 
       const btnStart = document.getElementById('btnStartSim');
       const btnSave = document.getElementById('btnSaveOfflinePack');
-      const activeBtn = saveOnly ? btnSave : btnStart;
+      const btnBank = document.getElementById('btnStartFromBank');
+      const activeBtn = source === 'bank' ? (btnBank || btnStart) : (saveOnly ? btnSave : btnStart);
       const origTxt = activeBtn.textContent;
       btnStart.disabled = true;
       if (btnSave) btnSave.disabled = true;
+      if (btnBank) btnBank.disabled = true;
 
       let combined = [];
+      let batteryFromBankMeta = null;
       try {
-        if (offlineNow) {
-          // Modo offline: fallback gracioso com questões salvas pendentes de revisão
-          const revs = includeRevs ? getSubjectReviewQuestions(assuntoIds).slice(0, totalQtd) : [];
-          if (!revs.length) {
-            throw new Error('Sem internet e sem revisões salvas para este subtópico. Abra uma bateria em "Baterias Salvas" ou conecte-se à internet.');
+        if (source === 'bank') {
+          activeBtn.textContent = '🗄️ Buscando questões no seu Banco…';
+          const effectiveExpand = expandToMateria !== null ? Boolean(expandToMateria) : Boolean(simBankUiPrefs.expandToMateria);
+          const effectiveShuffle = shuffleAlternatives !== null ? Boolean(shuffleAlternatives) : Boolean(simBankUiPrefs.shuffleAlternatives);
+          const effectiveMode = bankMode || simBankUiPrefs.mode || 'smart';
+          const drawnRes = await drawQuestionsFromBankWithFallback({
+            materiaId,
+            assuntoIds,
+            formato,
+            totalQtd,
+            plan,
+            bankMode: effectiveMode,
+            expandToMateria: effectiveExpand,
+            shuffleAlternatives: effectiveShuffle
+          });
+          if (!drawnRes.questions.length) {
+            throw new Error(effectiveExpand
+              ? 'Ainda não há questões salvas no banco para esta matéria. Gere uma bateria pela IA ou importe seu histórico antigo em Gerenciador → Dados e backup.'
+              : 'Nenhuma questão salva para este subtópico. Ative "Completar com outros subtópicos da matéria" nas opções do banco ou gere pela IA.');
           }
+          combined = drawnRes.questions.map(q => ({
+            ...q,
+            isFromBank: true,
+            nivel: AE.formatQuestionLevel(q.nivel || q.nivelInterno, 2),
+            conceitoChave: q.conceitoChave || q.assunto || ''
+          }));
+          batteryFromBankMeta = drawnRes.meta;
+        } else if (offlineNow) {
+          // Modo offline: fallback gracioso com questões salvas (revisões pendentes + histórico local)
+          const revs = includeRevs ? getSubjectReviewQuestions(assuntoIds).slice(0, totalQtd) : [];
           combined = revs.map(r => ({
             ...r,
             nivel: AE.formatQuestionLevel(r.nivel || 2),
@@ -11539,7 +12074,23 @@ ${questionsText}`;
             isExactReview: true,
             isReview: true
           }));
-          showToast(`Modo offline: montando bateria com ${combined.length} revisão(ões) salvas.`, 'ok');
+          if (combined.length < totalQtd) {
+            const excludeTexts = new Set(combined.map(q => normTxt(q.enunciado || '').slice(0, 160)).filter(Boolean));
+            const extraLocal = collectLocalFallbackQuestions({
+              materiaId,
+              assuntoIds,
+              limit: totalQtd - combined.length,
+              mode: simBankUiPrefs.mode || 'smart',
+              expandToMateria: Boolean(simBankUiPrefs.expandToMateria),
+              shuffleAlternatives: Boolean(simBankUiPrefs.shuffleAlternatives),
+              excludeTexts
+            });
+            combined = [...combined, ...extraLocal];
+          }
+          if (!combined.length) {
+            throw new Error('Sem internet e sem questões salvas para este subtópico. Abra uma bateria em "Baterias Salvas" ou conecte-se à internet.');
+          }
+          showToast(`Modo offline: montando bateria com ${combined.length} questão(ões) salvas.`, 'ok');
         } else {
           // 1. Monta localmente as questões ORIGINAIS erradas selecionadas nos slots isExactReview (1 em 5-9q, até 2 em 10-20q)
           const exactQuestions = [];
@@ -11573,6 +12124,9 @@ ${questionsText}`;
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
+                editalId: state.activeEdital || 'default',
+                materiaId,
+                assuntoIds,
                 materia: matNome,
                 assuntos: assNomes,
                 quantidade: cleanAiSlots.length,
@@ -11590,6 +12144,9 @@ ${questionsText}`;
               const slot = cleanAiSlots[idx] || {};
               const resolvedAssuntoId = q.assuntoId || slot.assuntoId || assuntoIds[0];
               return {
+                bankQuestionId: q.bankQuestionId || null,
+                fingerprint: q.fingerprint || '',
+                isFromBank: false,
                 isReview: Boolean(q.isActiveReview || slot.isActiveReview),
                 isActiveReview: Boolean(q.isActiveReview || slot.isActiveReview),
                 isExactReview: false,
@@ -11614,6 +12171,9 @@ ${questionsText}`;
           }
 
           combined = [...exactQuestions, ...aiQuestions];
+          if (aiQuestions.length > 0) {
+            scheduleSimBankStatsRefresh();
+          }
         }
 
         combined = combined.map(q => ({
@@ -11653,7 +12213,7 @@ ${questionsText}`;
           formato,
           primeiroEstudo,
           isValidationBattery: Boolean(plan.isValidationBattery),
-          compositionMode: plan.compositionMode,
+          compositionMode: source === 'bank' ? 'banco' : plan.compositionMode,
           subtopicStartLevels,
           currentIndex: 0,
           elapsedSeconds: 0,
@@ -11680,7 +12240,7 @@ ${questionsText}`;
           formato,
           primeiroEstudo,
           isValidationBattery: Boolean(plan.isValidationBattery),
-          compositionMode: plan.compositionMode,
+          compositionMode: source === 'bank' ? 'banco' : plan.compositionMode,
           subtopicStartLevels,
           questions: combined,
           currentIndex: 0,
@@ -11707,43 +12267,77 @@ ${questionsText}`;
         questionBox.style.display = 'none';
 
         const revCount = combined.filter(x => x.isActiveReview).length;
+        const bankCount = combined.filter(x => x.isFromBank).length;
+        const shufCount = combined.filter(x => x.alternativasEmbaralhadas).length;
         const distTxt = ['N1', 'N2', 'N3', 'N4', 'N5']
           .map(k => { const c = combined.filter(q => q.nivel === k).length; return c ? `${c}× ${k}` : ''; })
           .filter(Boolean).join(' · ');
         const auditBadge = combined.some(x => x.auditadaPelaIA)
           ? '<br><span style="color:var(--sage);font-size:12.5px;">🛡️ Gabaritos auditados com verificação lógica/matemática em 2 etapas.</span>'
           : '';
-        document.getElementById('simReadyTitle').textContent = plan.isValidationBattery
-          ? '🛡️ Bateria de Validação de Manutenção Pronta!'
-          : '✅ Bateria Calibrada Pronta!';
-        document.getElementById('simReadySub').innerHTML = `
-          Sua bateria <b>${escapeHtml(plan.compositionMode)}</b> de <b>${combined.length} questão(ões)</b> de <b>${escapeHtml(matNome)}</b> (${escapeHtml(assNomes.join(', '))}) no padrão <b>${escapeHtml(banca)}</b> está pronta!
-          <br><span class="hint">Matriz N1–N5: ${distTxt}${revCount ? ` · ${revCount} revisão(ões) ativa(s) inédita(s) nos primeiros slots` : ''} · Lembre de marcar <b>Certeza / Dúvida / Chute</b> antes do gabarito.</span>
-          ${plan.frustrationDropApplied ? '<br><span style="color:var(--amber);font-size:12.5px;">🛡️ Trava de Frustração ativa: dificuldade reduzida em 1 degrau nesta bateria.</span>' : ''}
-          ${auditBadge}
-        `;
+        if (source === 'bank') {
+          const expNote = batteryFromBankMeta && batteryFromBankMeta.expandedToMateria
+            ? ` (${batteryFromBankMeta.fromSubtopics} do subtópico + ${batteryFromBankMeta.fromMateria} de outros subtópicos de ${escapeHtml(matNome)})`
+            : '';
+          document.getElementById('simReadyTitle').textContent = '🗄️ Bateria do Banco de Questões Pronta!';
+          document.getElementById('simReadySub').innerHTML = `
+            Montamos <b>${combined.length} questão(ões)</b> do seu acervo salvo de <b>${escapeHtml(matNome)}</b>${expNote} sem usar cota da IA!
+            <br><span class="hint">Matriz N1–N5: ${distTxt}${shufCount ? ` · 🔀 ${shufCount} com alternativas embaralhadas` : ''} · Comentários do professor já inclusos.</span>
+          `;
+        } else {
+          document.getElementById('simReadyTitle').textContent = plan.isValidationBattery
+            ? '🛡️ Bateria de Validação de Manutenção Pronta!'
+            : '✅ Bateria Calibrada Pronta!';
+          document.getElementById('simReadySub').innerHTML = `
+            Sua bateria <b>${escapeHtml(plan.compositionMode)}</b> de <b>${combined.length} questão(ões)</b> de <b>${escapeHtml(matNome)}</b> (${escapeHtml(assNomes.join(', '))}) no padrão <b>${escapeHtml(banca)}</b> está pronta!
+            <br><span class="hint">Matriz N1–N5: ${distTxt}${revCount ? ` · ${revCount} revisão(ões) ativa(s) inédita(s) nos primeiros slots` : ''}${bankCount ? ` · ${bankCount} do banco` : ''} · Lembre de marcar <b>Certeza / Dúvida / Chute</b> antes do gabarito.</span>
+            ${plan.frustrationDropApplied ? '<br><span style="color:var(--amber);font-size:12.5px;">🛡️ Trava de Frustração ativa: dificuldade reduzida em 1 degrau nesta bateria.</span>' : ''}
+            ${auditBadge}
+          `;
+        }
         prepareSimWarmupGate(combined);
 
         beep();
         sendBrowserNotification(
-          '✅ Bateria calibrada pronta!',
+          source === 'bank' ? '🗄️ Bateria do Banco pronta!' : '✅ Bateria calibrada pronta!',
           `${combined.length} questão(ões) (${distTxt}) de ${matNome} prontas para iniciar!`,
           { tag: 'painel-sim-ready', requireInteraction: true }
         );
-        showToast('Bateria calibrada e salva localmente! Clique em "Iniciar Resolução Agora".', 'ok');
+        showToast(
+          source === 'bank'
+            ? `🗄️ ${combined.length} questão(ões) carregadas do seu Banco! Clique em "Iniciar Resolução Agora".`
+            : 'Bateria calibrada e salva no Banco! Clique em "Iniciar Resolução Agora".',
+          'ok'
+        );
       } catch (e) {
         showToast('Não foi possível montar a bateria: ' + e.message);
+        if (source === 'ai') {
+          showSimAiFallbackBox({
+            errorMessage: e.message,
+            materiaId,
+            assuntoIds,
+            totalQtd,
+            saveOnly,
+            isValidationBattery
+          });
+        }
       } finally {
         btnStart.disabled = false;
         if (btnSave) btnSave.disabled = false;
+        if (btnBank) btnBank.disabled = false;
         activeBtn.textContent = origTxt;
+        if (source === 'bank') renderSimBankStatusBar();
       }
     }
 
-    document.getElementById('btnStartSim').onclick = () => generateOrPrepareBattery({ saveOnly: false });
+    document.getElementById('btnStartSim').onclick = () => generateOrPrepareBattery({ saveOnly: false, source: 'ai' });
     const btnSaveOfflinePackEl = document.getElementById('btnSaveOfflinePack');
     if (btnSaveOfflinePackEl) {
-      btnSaveOfflinePackEl.onclick = () => generateOrPrepareBattery({ saveOnly: true });
+      btnSaveOfflinePackEl.onclick = () => generateOrPrepareBattery({ saveOnly: true, source: 'ai' });
+    }
+    const btnStartFromBankEl = document.getElementById('btnStartFromBank');
+    if (btnStartFromBankEl) {
+      btnStartFromBankEl.onclick = () => generateOrPrepareBattery({ saveOnly: false, source: 'bank' });
     }
 
     document.getElementById('btnConfirmStartSim').onclick = () => {
@@ -11854,7 +12448,20 @@ ${questionsText}`;
 
       // Cabeçalho da questão (Nível N1-N5 oculto antes de confirmar para não enviesar confiança!)
       const tagEl = document.getElementById('simQTag');
-      if (q.isExactReview) {
+      if (q.isFromBank) {
+        tagEl.className = 'sim-q-tag bank-q';
+        let lastStr = '';
+        if (q.lastAnsweredAt) {
+          const ld = new Date(q.lastAnsweredAt);
+          if (!Number.isNaN(ld.getTime())) lastStr = ` · última: ${pad(ld.getDate())}/${pad(ld.getMonth() + 1)}`;
+        } else if (q.pastDate) {
+          lastStr = ` · última: ${q.pastDate}`;
+        }
+        const shufBadge = q.alternativasEmbaralhadas ? ' · 🔀' : '';
+        tagEl.textContent = q.confirmed
+          ? `🗄️ Do seu Banco · ${q.nivel} (${AE.getQuestionLevelInfo(q.nivel).focus})${lastStr}${shufBadge}`
+          : `🗄️ Do seu Banco${lastStr}${shufBadge} · Estilo ${q.banca || banca}`;
+      } else if (q.isExactReview) {
         tagEl.className = 'sim-q-tag rev-q';
         const curSrs = q.srsAfter || q.srs;
         const stageTxt = curSrs ? curSrs.stageLabel : '1d';
@@ -12716,6 +13323,59 @@ ${questionsText}`;
 
       simState = null;
       saveStateNow();
+
+      // Registra no Banco Permanente o resultado de TODAS as questões da bateria (acertos, dúvidas, chutes e erros)
+      if (!isAppOffline()) {
+        const attemptsPayload = questions
+          .filter(q => q && q.enunciado && Array.isArray(q.alternativas) && q.alternativas.length >= 2)
+          .map(q => {
+            const isCorrect = q.selectedLetter === q.correta;
+            let result = 'error';
+            if (isCorrect) {
+              if (q.confidence === 'chute') result = 'chute';
+              else if (q.confidence === 'duvida') result = 'doubt_hit';
+              else result = 'hit';
+            }
+            return {
+              bankQuestionId: q.bankQuestionId || null,
+              fingerprint: q.fingerprint || '',
+              editalId: state.activeEdital || 'default',
+              materiaId,
+              materiaNome: materiaNome(materiaId),
+              assuntoId: q.assuntoId || assuntoIds[0] || null,
+              assuntoNome: q.assunto || '',
+              banca: q.banca || banca || 'FGV',
+              formato: q.formato || 'multipla_escolha',
+              nivel: q.nivel || 'N2',
+              conceitoChave: q.conceitoChave || '',
+              enunciado: q.enunciado,
+              alternativas: q.alternativas,
+              correta: q.correta,
+              resolucaoPassoAPassoVerificada: q.resolucaoPassoAPassoVerificada || '',
+              comentarioProfessor: q.comentarioProfessor || '',
+              geradaPelaIA: q.geradaPelaIA !== false,
+              auditadaPelaIA: Boolean(q.auditadaPelaIA),
+              result,
+              answeredAt: nowIso
+            };
+          });
+        if (attemptsPayload.length) {
+          fetch('/api/questions/attempts', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              editalId: state.activeEdital || 'default',
+              materiaId,
+              materiaNome: materiaNome(materiaId),
+              banca: banca || 'FGV',
+              attempts: attemptsPayload
+            })
+          })
+            .then(() => scheduleSimBankStatsRefresh())
+            .catch(() => {});
+        }
+      }
+
       document.getElementById('simArenaPanel').style.display = 'none';
       document.getElementById('simSetupPanel').style.display = '';
       renderAll();
@@ -12756,6 +13416,42 @@ ${questionsText}`;
             showToast(updated > 0 ? `🎯 ${updated} subtópico(s) calibrado(s) com base no histórico!` : 'Nenhum subtópico elegível para calibração encontrado.', 'ok');
           }
         );
+      };
+    }
+
+    // Botão no Gerenciador: importar questões antigas do histórico para o Banco Permanente
+    const btnBackfillBank = document.getElementById('btnBackfillQuestionBank');
+    if (btnBackfillBank) {
+      btnBackfillBank.onclick = async () => {
+        if (isAppOffline()) {
+          showToast('Conecte-se à internet para importar questões no Banco Permanente.');
+          return;
+        }
+        const origTxt = btnBackfillBank.textContent;
+        btnBackfillBank.disabled = true;
+        btnBackfillBank.textContent = '🗄️ Importando questões…';
+        try {
+          const res = await fetch('/api/questions/backfill', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({})
+          });
+          const data = await res.json();
+          if (!res.ok || !data.ok) {
+            throw new Error(data.error || ('HTTP ' + res.status));
+          }
+          showToast(
+            `🗄️ Banco atualizado! ${data.inserted} questão(ões) importada(s), ${data.skipped} já estavam salvas (total analisado: ${data.extracted}).`,
+            'ok'
+          );
+          simBankAutoBackfillDone = true;
+          refreshSimBankStats();
+        } catch (err) {
+          showToast('Falha ao importar questões para o Banco: ' + err.message);
+        } finally {
+          btnBackfillBank.disabled = false;
+          btnBackfillBank.textContent = origTxt;
+        }
       };
     }
 

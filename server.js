@@ -13,6 +13,7 @@ import {
 import { resolveSyncState } from './shared/state-merge.js';
 import { createStorageAdapter } from './shared/storage.js';
 import { createAuthHelper } from './shared/auth.js';
+import { computeQuestionFingerprint } from './shared/question-bank.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -753,8 +754,11 @@ REGRA DE OURO DA REVISÃO ATIVA INÉDITA:
 app.post('/api/gemini/generate-questions', async (req, res) => {
   try {
     const {
+      editalId = '',
+      materiaId = '',
       materia,
       assuntos = [],
+      assuntoIds = [],
       quantidade = 5,
       banca = 'FGV',
       concurso = 'TJPB (Analista de TI: Desenvolvimento de Sistemas)',
@@ -854,13 +858,154 @@ ${historicoErrosPrompt}${instrucoesExtras ? `\nINSTRUÇÕES EXTRAS DO ALUNO:\n${
       finalQuestions = await auditAndFixQuestionsBatch(client, result.usedModel || model, finalQuestions, banca);
     }
 
+    // Salva automaticamente todas as questões geradas no Banco Permanente (não-bloqueante caso tabela ainda não exista)
+    let bankSavedCount = 0;
+    try {
+      const fallbackAssuntoId = Array.isArray(assuntoIds) && assuntoIds.length ? assuntoIds[0] : null;
+      const bankInputs = finalQuestions.map((q) => ({
+        editalId: editalId || 'default',
+        materiaId: materiaId || null,
+        materiaNome: materia || '',
+        assuntoId: q.assuntoId || fallbackAssuntoId,
+        assuntoNome: q.assunto || '',
+        banca,
+        formato,
+        nivel: q.nivel,
+        conceitoChave: q.conceitoChave || '',
+        enunciado: q.enunciado,
+        alternativas: q.alternativas,
+        correta: q.correta,
+        resolucaoPassoAPassoVerificada: q.resolucaoPassoAPassoVerificada || '',
+        comentarioProfessor: q.comentarioProfessor || '',
+        geradaPelaIA: true,
+        auditadaPelaIA: Boolean(q.auditadaPelaIA),
+        modelUsed: result.usedModel || model
+      }));
+      const saveRes = await storage.saveQuestionsToBank(bankInputs);
+      bankSavedCount = saveRes.total || 0;
+      const savedByFp = new Map((saveRes.items || []).map((item) => [item.fingerprint, item]));
+      finalQuestions = finalQuestions.map((q) => {
+        const fp = computeQuestionFingerprint({ editalId: editalId || 'default', enunciado: q.enunciado });
+        const savedRow = fp ? savedByFp.get(fp) : null;
+        return savedRow
+          ? { ...q, bankQuestionId: savedRow.id, fingerprint: savedRow.fingerprint }
+          : q;
+      });
+    } catch (bankErr) {
+      console.warn('[QuestionBank] Falha não-bloqueante ao salvar questões geradas:', bankErr.message);
+    }
+
     res.json({
       ok: true,
       model: result.usedModel || model,
+      bankSavedCount,
       questoes: finalQuestions
     });
   } catch (err) {
     res.status(err.status || 500).json({ ok: false, error: err.message || 'Erro ao gerar questões no Gemini.' });
+  }
+});
+
+// ---------- ROTAS DO BANCO PERMANENTE DE QUESTÕES ----------
+app.get('/api/questions/stats', async (req, res) => {
+  try {
+    const editalId = String(req.query.editalId || '').trim();
+    const materiaId = String(req.query.materiaId || '').trim() || null;
+    const rawAssuntos = String(req.query.assuntoIds || '').trim();
+    const assuntoIds = rawAssuntos ? rawAssuntos.split(',').map((s) => s.trim()).filter(Boolean) : [];
+    const stats = await storage.getQuestionBankStats({ editalId: editalId || null, materiaId, assuntoIds });
+    return res.json({ ok: true, stats, tableMissing: false });
+  } catch (err) {
+    if (err && err.code === 'QUESTIONS_TABLE_MISSING') {
+      return res.json({
+        ok: true,
+        tableMissing: true,
+        warning: err.message,
+        stats: { totalEdital: 0, totalMateria: 0, totalSubtopics: 0, errorsSubtopics: 0, errorsMateria: 0 }
+      });
+    }
+    return res.status(err.status || 500).json({ ok: false, error: err.message || 'Erro ao consultar estatísticas do banco de questões.' });
+  }
+});
+
+app.post('/api/questions/draw', async (req, res) => {
+  try {
+    const {
+      editalId = '',
+      materiaId = null,
+      assuntoIds = [],
+      formato = 'any',
+      mode = 'smart',
+      limit = 5,
+      slotPlan = null,
+      expandToMateria = false,
+      excludeIds = [],
+      shuffleAlternatives = true
+    } = req.body || {};
+
+    const result = await storage.queryQuestionBank({
+      editalId: editalId || null,
+      materiaId: materiaId || null,
+      assuntoIds: Array.isArray(assuntoIds) ? assuntoIds : [],
+      formato,
+      mode,
+      limit: Math.max(1, Math.min(20, Number(limit) || 5)),
+      slotPlan,
+      expandToMateria: Boolean(expandToMateria),
+      excludeIds: Array.isArray(excludeIds) ? excludeIds : [],
+      shuffleAlternatives: shuffleAlternatives !== false
+    });
+
+    return res.json({
+      ok: true,
+      questoes: result.questions,
+      meta: result.meta
+    });
+  } catch (err) {
+    if (err && err.code === 'QUESTIONS_TABLE_MISSING') {
+      return res.status(503).json({ ok: false, tableMissing: true, error: err.message });
+    }
+    return res.status(err.status || 500).json({ ok: false, error: err.message || 'Erro ao sortear questões do banco.' });
+  }
+});
+
+app.post('/api/questions/attempts', async (req, res) => {
+  try {
+    const {
+      editalId = 'default',
+      materiaId = null,
+      materiaNome = '',
+      banca = 'FGV',
+      formato = 'multipla_escolha',
+      attempts = []
+    } = req.body || {};
+
+    if (!Array.isArray(attempts) || !attempts.length) {
+      return res.json({ ok: true, updated: 0, inserted: 0 });
+    }
+
+    const result = await storage.recordQuestionAttempts(attempts, {
+      defaults: { editalId, materiaId, materiaNome, banca, formato }
+    });
+    return res.json({ ok: true, ...result });
+  } catch (err) {
+    if (err && err.code === 'QUESTIONS_TABLE_MISSING') {
+      return res.status(200).json({ ok: false, tableMissing: true, error: err.message });
+    }
+    return res.status(err.status || 500).json({ ok: false, error: err.message || 'Erro ao registrar tentativas no banco de questões.' });
+  }
+});
+
+app.post('/api/questions/backfill', async (req, res) => {
+  try {
+    const incomingState = req.body && req.body.state && typeof req.body.state === 'object' ? req.body.state : null;
+    const result = await storage.backfillQuestionsFromState(incomingState);
+    return res.json({ ok: true, ...result });
+  } catch (err) {
+    if (err && err.code === 'QUESTIONS_TABLE_MISSING') {
+      return res.status(503).json({ ok: false, tableMissing: true, error: err.message });
+    }
+    return res.status(err.status || 500).json({ ok: false, error: err.message || 'Erro ao importar questões antigas para o banco.' });
   }
 });
 
